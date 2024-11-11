@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+
+<body>
+    <canvas id="webgpu-canvas" width="640" height="480"></canvas>
+    <script>
+
+        async function gpuBitonicSort(dataArray) {
+            const adapter = await navigator.gpu.requestAdapter();
+            const device = await adapter.requestDevice();
+
+            // Shader kodunu buraya yerleştirin
+            const shaderCode = `
+// WGSL shader kodu
+@group(0) @binding(0)
+var<storage, read_write> data: array<f32>;
+
+@group(0) @binding(1)
+var<uniform> params: Params;
+
+struct Params {
+  N: u32,
+}
+
+fn compareAndSwap(i: u32, j: u32, dir: bool) {
+  if (i >= params.N || j >= params.N) {
+    return;
+  }
+  let temp: f32 = data[i];
+  if ((dir && data[i] > data[j]) || (!dir && data[i] < data[j])) {
+    data[i] = data[j];
+    data[j] = temp;
+  }
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+  let i = global_id.x;
+  let N = params.N;
+
+  var k: u32 = 2u;
+  while (k <= N) {
+    var j = k >> 1u;
+    while (j > 0u) {
+      let ixj = i ^ j;
+      if (ixj > i) {
+        let dir = ((i & k) == 0u);
+        compareAndSwap(i, ixj, dir);
+      }
+      j = j >> 1u;
+      workgroupBarrier();
+    }
+    k = k << 1u;
+    workgroupBarrier();
+  }
+}
+`;
+
+            const shaderModule = device.createShaderModule({ code: shaderCode });
+
+            // Veri boyutunu ve buffer'ları ayarla
+            const dataSize = dataArray.length * dataArray.BYTES_PER_ELEMENT;
+
+            // GPU buffer oluştur
+            const gpuBuffer = device.createBuffer({
+                size: dataSize,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+                mappedAtCreation: true,
+            });
+
+            new Float32Array(gpuBuffer.getMappedRange()).set(dataArray);
+            gpuBuffer.unmap();
+
+            // Uniform buffer oluştur
+            const paramsBufferSize = 4; // u32 boyutu
+            const paramsBuffer = device.createBuffer({
+                size: paramsBufferSize,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+
+            // N değerini uniform buffer'a yaz
+            const N = dataArray.length;
+            const paramsArray = new Uint32Array([N]);
+            device.queue.writeBuffer(paramsBuffer, 0, paramsArray.buffer, paramsArray.byteOffset, paramsArray.byteLength);
+
+            // Bind group layout ve pipeline oluştur
+            const bindGroupLayout = device.createBindGroupLayout({
+                entries: [
+                    {
+                        binding: 0,
+                        visibility: GPUShaderStage.COMPUTE,
+                        buffer: { type: 'storage' },
+                    },
+                    {
+                        binding: 1,
+                        visibility: GPUShaderStage.COMPUTE,
+                        buffer: { type: 'uniform' },
+                    },
+                ],
+            });
+
+            const pipelineLayout = device.createPipelineLayout({
+                bindGroupLayouts: [bindGroupLayout],
+            });
+
+            const computePipeline = device.createComputePipeline({
+                layout: pipelineLayout,
+                compute: {
+                    module: shaderModule,
+                    entryPoint: 'main',
+                },
+            });
+
+            const bindGroup = device.createBindGroup({
+                layout: bindGroupLayout,
+                entries: [
+                    {
+                        binding: 0,
+                        resource: { buffer: gpuBuffer },
+                    },
+                    {
+                        binding: 1,
+                        resource: { buffer: paramsBuffer },
+                    },
+                ],
+            });
+
+            // Komutları oluştur ve çalıştır
+            const commandEncoder = device.createCommandEncoder();
+            const passEncoder = commandEncoder.beginComputePass();
+            passEncoder.setPipeline(computePipeline);
+            passEncoder.setBindGroup(0, bindGroup);
+
+            const workgroupSize = 256;
+            const numWorkgroups = Math.ceil(N / workgroupSize);
+
+            passEncoder.dispatchWorkgroups(numWorkgroups);
+            passEncoder.end();
+
+            // Sonuçları okuyabilmek için bir buffer oluştur
+            const gpuReadBuffer = device.createBuffer({
+                size: dataSize,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            });
+
+            // Komutları gönder
+            commandEncoder.copyBufferToBuffer(gpuBuffer, 0, gpuReadBuffer, 0, dataSize);
+            device.queue.submit([commandEncoder.finish()]);
+
+            // Sonuçları oku
+            await gpuReadBuffer.mapAsync(GPUMapMode.READ);
+            const resultArrayBuffer = gpuReadBuffer.getMappedRange();
+            const resultArray = new Float32Array(resultArrayBuffer.slice(0));
+            gpuReadBuffer.unmap();
+
+            return resultArray;
+        }
+
+        (async () => {
+            // Rastgele veriler oluştur
+            const dataSize = 64 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2; // 1 milyon eleman
+            console.log(dataSize);
+            const dataArray = new Float32Array(dataSize);
+            for (let i = 0; i < dataSize; i++) {
+                dataArray[i] = Math.random();
+            }
+
+            // CPU sıralaması
+            console.time('CPU Sort');
+            const cpuSortedArray = dataArray.slice().sort((a, b) => a - b);
+            console.timeEnd('CPU Sort');
+
+            // GPU sıralaması
+            console.time('GPU Sort');
+            const gpuSortedArray = await gpuBitonicSort(dataArray);
+            console.timeEnd('GPU Sort');
+
+            // Sonuçların eşleştiğini kontrol edelim
+            let isEqual = true;
+            for (let i = 0; i < dataSize; i++) {
+                if (Math.abs(cpuSortedArray[i] - gpuSortedArray[i]) > 1e-5) {
+                    isEqual = false;
+                    console.error(`Farklı eleman bulundu: CPU=${cpuSortedArray[i]}, GPU=${gpuSortedArray[i]}`);
+                    break;
+                }
+            }
+            console.log('Sonuçlar eşleşiyor mu?', isEqual);
+        })();
+
+
+    </script>
+</body>
+
+</html>
